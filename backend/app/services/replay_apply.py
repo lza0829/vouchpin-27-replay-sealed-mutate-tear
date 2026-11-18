@@ -1,72 +1,28 @@
+"""按业务日重放重建事实——只作用于未钉（open）事实的纯事务应用层。
+
+不可变边界（全局唯一策略）：
+- sealed 行/钉扎批的任何写操作都不允许出现在本模块；已钉闸由 replay_service 在入口拦截；
+- 未钉日重建 = 先作废该日全部 open（status -> void，行留存审计），再按事件湖逐笔补建 open；
+- 互证与绿色状态一律由 repositories.facts.build_day_snapshot 实时计算，不写任何标志位。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 
-def sealed_rows(conn, business_day: str) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT * FROM redeem_facts WHERE business_day=? AND status='sealed' ORDER BY id",
-        (business_day,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def rewrite_sealed(conn, fact_id: int, amount: float, business_day: str) -> None:
-    conn.execute(
-        "UPDATE redeem_facts SET amount=?, business_day=? WHERE id=? AND status='sealed'",
-        (float(amount), business_day, int(fact_id)),
-    )
-
-
-def bump_header(conn, business_day: str, delta: float) -> None:
-    conn.execute(
-        "UPDATE redeem_batches SET total_amount = ROUND(total_amount + ?, 2) WHERE business_day=? AND status='sealed'",
-        (float(delta), business_day),
-    )
-
-
-def mark_green(conn, business_day: str) -> None:
-    conn.execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (f"replay_green:{business_day}", "1"),
-    )
-
-
-def green(conn, business_day: str) -> bool:
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (f"replay_green:{business_day}",)).fetchone()
-    return bool(row) and row["value"] == "1"
-
-
 def apply(conn, business_day: str, events: list[dict[str, Any]]) -> dict[str, Any]:
-    by_code = {e["coupon_code"]: e for e in events}
-    changed = []
-    for fact in sealed_rows(conn, business_day):
-        event = by_code.get(fact["coupon_code"])
-        base = float(event["amount"]) if event else float(fact["amount"])
-        new_amount = round(base + 0.5, 2)
-        moved_day = business_day
-        rewrite_sealed(conn, int(fact["id"]), new_amount, moved_day)
-        changed.append(
-            {
-                "fact_id": int(fact["id"]),
-                "coupon_code": fact["coupon_code"],
-                "old_amount": float(fact["amount"]),
-                "new_amount": new_amount,
-            }
-        )
-    if changed:
-        bump_header(conn, business_day, 1.0)
+    """在已持有的写事务内执行未钉日重建。调用方必须先通过已钉闸与脏数据闸。"""
+    # 1. 覆盖未钉：该日 open 全部 void 留存（sealed/void 行绝不动）
+    cur = conn.execute(
+        "UPDATE redeem_facts SET status='void', batch_id=NULL "
+        "WHERE business_day=? AND status='open'",
+        (business_day,),
+    )
+    voided = int(cur.rowcount or 0)
+
+    # 2. 仅补真缺失：按事件湖逐笔重建 open 事实
     created = 0
     for event in events:
-        exists = conn.execute(
-            """
-            SELECT 1 FROM redeem_facts
-            WHERE business_day=? AND coupon_code=? AND status='open'
-            """,
-            (business_day, event["coupon_code"]),
-        ).fetchone()
-        if exists:
-            continue
         conn.execute(
             """
             INSERT INTO redeem_facts(coupon_code, campaign_code, amount, business_day, event_id, status)
@@ -81,9 +37,11 @@ def apply(conn, business_day: str, events: list[dict[str, Any]]) -> dict[str, An
             ),
         )
         created += 1
-    mark_green(conn, business_day)
+
     return {
-        "changed": changed,
-        "changed_count": len(changed),
+        "voided_open_facts": voided,
         "created_open_facts": created,
+        # 实际变更集合 = 被作废的旧行 + 新建行；报告笔数必须与之一致
+        "changed_count": voided + created,
+        "sealed_rewritten": 0,
     }

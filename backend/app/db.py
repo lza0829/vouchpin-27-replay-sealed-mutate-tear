@@ -46,14 +46,18 @@ CREATE TABLE IF NOT EXISTS redeem_batches (
   fact_count INTEGER NOT NULL DEFAULT 0,
   total_amount REAL NOT NULL DEFAULT 0,
   sealed_at TEXT,
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT,
+  pin_snapshot TEXT
 );
 '''
 
 
 def connect(immediate: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
+    # 重建 ∥ 钉扎 并发写时排队等锁而非直接报 locked，由 BEGIN IMMEDIATE 串行化
+    conn.execute("PRAGMA busy_timeout=8000")
     if immediate:
         conn.execute("BEGIN IMMEDIATE")
     return conn
@@ -96,11 +100,41 @@ def _migrate_facts_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_batches_table(conn: sqlite3.Connection) -> None:
+    """老库 redeem_batches 无 fingerprint/pin_snapshot 列。
+
+    加列后，按各批当前 sealed 事实回填钉时快照与指纹（老批以现状为钉时基线）。
+    此后任何对 sealed 行/批头的静默改写都会在读取时被指纹比对暴露。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(redeem_batches)").fetchall()}
+    if "fingerprint" not in cols:
+        conn.execute("ALTER TABLE redeem_batches ADD COLUMN fingerprint TEXT")
+    if "pin_snapshot" not in cols:
+        conn.execute("ALTER TABLE redeem_batches ADD COLUMN pin_snapshot TEXT")
+    rows = conn.execute(
+        "SELECT id FROM redeem_batches WHERE status='sealed' "
+        "AND (fingerprint IS NULL OR pin_snapshot IS NULL) ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return
+    from app.repositories.batches import compute_pin_artifacts, set_pin_artifacts
+    for r in rows:
+        bid = int(r["id"])
+        facts = conn.execute(
+            "SELECT id, coupon_code, campaign_code, amount, business_day, event_id "
+            "FROM redeem_facts WHERE batch_id=? AND status='sealed' ORDER BY id",
+            (bid,),
+        ).fetchall()
+        fingerprint, snapshot = compute_pin_artifacts([dict(f) for f in facts])
+        set_pin_artifacts(conn, bid, fingerprint, snapshot)
+
+
 def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
         _migrate_facts_table(conn)
+        _migrate_batches_table(conn)
         conn.commit()
     finally:
         conn.close()

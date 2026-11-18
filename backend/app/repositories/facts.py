@@ -82,6 +82,7 @@ def duplicate_redeem_codes(conn: sqlite3.Connection, business_day: str) -> list[
 
 def build_day_snapshot(conn: sqlite3.Connection, business_day: str) -> dict[str, Any]:
     """同源预览：事件侧与事实侧在同一连接/事务内计算，供预览接口与重放任务共用。"""
+    from app.repositories import batches as batch_repo
     events = redeem_events_for_day(conn, business_day)
     opens = open_facts_for_day(conn, business_day)
     active = active_facts_for_day(conn, business_day)
@@ -90,16 +91,35 @@ def build_day_snapshot(conn: sqlite3.Connection, business_day: str) -> dict[str,
     # 逐码金额比对：码集一致且每码金额一致才算可对（仅比总额会漏掉同码集对调金额）
     event_amounts = {e["coupon_code"]: round(float(e["amount"]), 2) for e in events}
     active_amounts = {f["coupon_code"]: round(float(f["amount"]), 2) for f in active}
+    sealed = day_is_sealed(conn, business_day)
+    # 已钉日：批指纹是不可变边界的守卫。sealed 行/批头被任何路径静默改写后，
+    # 重算指纹必然与钉时指纹分叉——互证必须报分叉，绝不假绿。
+    fingerprint_ok = True
+    header_ok = True
+    batch = None
+    if sealed:
+        row = conn.execute(
+            "SELECT * FROM redeem_batches WHERE business_day=? AND status='sealed' ORDER BY id LIMIT 1",
+            (business_day,),
+        ).fetchone()
+        if row is not None:
+            batch = batch_repo.verify_batch(conn, row)
+            fingerprint_ok = bool(batch["fingerprint_ok"])
+            header_ok = bool(batch["header_ok"])
+    reconciled = event_amounts == active_amounts and fingerprint_ok and header_ok
     return {
         "business_day": business_day,
-        "already_sealed": day_is_sealed(conn, business_day),
+        "already_sealed": sealed,
         "redeem_event_count": len(events),
         "redeem_event_total": event_total,
         "open_count": len(opens),
         "open_total": open_total,
-        # 互证：有效事实（open+sealed）与 redeem 事件逐码逐额对齐；void 不参与。
-        # 重放仅在未钉日运行（此时无 sealed 行），故该守卫对重放同样成立。
-        "reconciled": event_amounts == active_amounts,
+        # 互证：有效事实（open+sealed）与 redeem 事件逐码逐额对齐；void 不参与；
+        # 已钉日额外要求批指纹/批头与钉时一致，任何静默改写都判分叉。
+        "reconciled": reconciled,
+        "fingerprint_ok": fingerprint_ok,
+        "header_ok": header_ok,
+        "batch": batch,
         "facts": opens,
     }
 

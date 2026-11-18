@@ -21,8 +21,11 @@ def dashboard() -> dict[str, Any]:
         events = event_repo.list_events(conn, day)
         batches = batch_repo.list_batches(conn)
         sealed_today = fact_repo.day_is_sealed(conn, day)
-        from app.services import replay_apply
-        recon_ok = replay_apply.green(conn, day) or not sealed_today
+        # 互证实时计算（与预览/重建报告同源）：已钉日还要求批指纹未分叉。
+        # 不存在持久化绿色标志——sealed 行或批头被静默改写时这里必须显示分叉。
+        snapshot = fact_repo.build_day_snapshot(conn, day)
+        recon_ok = bool(snapshot["reconciled"])
+        fingerprint_ok = bool(snapshot["fingerprint_ok"])
         return {
             "business_day": day,
             "event_count": len(events),
@@ -33,7 +36,8 @@ def dashboard() -> dict[str, Any]:
             "redeem_total_today": total,
             "batch_count": len(batches),
             "day_sealed": sealed_today,
-            "recon_ok": recon_ok if sealed_today else True,
+            "recon_ok": recon_ok,
+            "fingerprint_ok": fingerprint_ok,
         }
     finally:
         conn.close()

@@ -37,6 +37,8 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
         if not opens:
             raise HTTPException(400, "无可钉扎的 open 核销事实")
         total = round(sum(float(f["amount"]) for f in opens), 2)
+        # 钉时指纹 + 逐行快照：此后 sealed 行不可变，任何静默改写都会在读取时被指纹比对暴露
+        fingerprint, pin_snapshot = batch_repo.compute_pin_artifacts(opens)
         bid = batch_repo.create_batch(
             conn,
             business_day=day,
@@ -45,6 +47,8 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
             total_amount=total,
             sealed_at=datetime.now().replace(microsecond=0).isoformat(),
             note=body.get("note") or "",
+            fingerprint=fingerprint,
+            pin_snapshot=pin_snapshot,
         )
         fact_repo.mark_batched(conn, [int(f["id"]) for f in opens], bid)
         conn.commit()
@@ -54,6 +58,7 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
             "fact_count": len(opens),
             "total_amount": total,
             "status": "sealed",
+            "fingerprint": fingerprint,
         }
     finally:
         conn.close()

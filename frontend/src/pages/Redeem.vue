@@ -3,18 +3,22 @@ import { onMounted, ref } from 'vue'
 import { api } from '../api'
 
 const preview = ref(null)
+const report = ref(null)
 const msg = ref('')
 const err = ref('')
 
 async function load() {
   err.value = ''
-  try { preview.value = await api.preview() } catch (e) { err.value = e.message }
+  try {
+    preview.value = await api.preview()
+    report.value = await api.replayReport()
+  } catch (e) { err.value = e.message }
 }
 async function seal() {
   msg.value = ''; err.value = ''
   try {
     const r = await api.seal({})
-    msg.value = `已钉扎批次 #${r.batch_id} · ${r.fact_count} 笔 · 合计 ${r.total_amount}`
+    msg.value = `已钉扎批次 #${r.batch_id} · ${r.fact_count} 笔 · 合计 ${r.total_amount} · 指纹 ${r.fingerprint}`
     await load()
   } catch (e) { err.value = e.message }
 }
@@ -22,7 +26,7 @@ async function replay() {
   msg.value = ''; err.value = ''
   try {
     const r = await api.replay({})
-    msg.value = `重放完成：作废旧 open ${r.voided_open_facts} 笔，按事件重建 ${r.created_open_facts} 笔，互证${r.reconciled ? '通过' : '失败'}`
+    msg.value = `重放完成：作废旧 open ${r.voided_open_facts} 笔，按事件重建 ${r.created_open_facts} 笔（实际变更集 ${r.changed_count}），互证${r.reconciled ? '通过' : '失败'}`
     await load()
   } catch (e) { err.value = e.message }
 }
@@ -36,6 +40,7 @@ onMounted(load)
       <div class="stat"><div class="k">待钉合计</div><div class="v ticket">{{ preview.open_total }}</div></div>
       <div class="stat"><div class="k">事件侧核销合计</div><div class="v">{{ preview.redeem_event_total }}（{{ preview.redeem_event_count }} 笔）</div></div>
       <div class="stat"><div class="k">已钉扎</div><div class="v">{{ preview.already_sealed ? '是' : '否' }}</div></div>
+      <div class="stat"><div class="k">批指纹</div><div class="v" :class="{ ticket: preview.already_sealed && !preview.fingerprint_ok }">{{ !preview.already_sealed ? '未钉' : (preview.fingerprint_ok ? '自洽' : '分叉') }}</div></div>
       <div class="stat"><div class="k">预览互证</div><div class="v" :class="{ ticket: !preview.reconciled }">{{ preview.reconciled ? '可对' : '不符' }}</div></div>
     </div>
     <div class="row">
@@ -43,7 +48,14 @@ onMounted(load)
       <button type="button" class="ghost" @click="replay" :disabled="preview.already_sealed">按日重放重建（覆盖未钉）</button>
       <button type="button" class="ghost" @click="load">刷新预览</button>
     </div>
-    <p class="msg" v-if="preview.already_sealed">该业务日已钉扎：拒绝重放，sealed 事实金额不可改写。</p>
+    <p class="msg" v-if="preview.already_sealed">该业务日已钉扎：拒绝重放，sealed 事实金额不可改写；重放只允许补真缺失的未钉行。</p>
+    <p class="msg err" v-if="report && report.failures && report.failures.length">
+      重建报告失败桶（{{ report.failures.length }}）：
+      <template v-for="f in report.failures" :key="f.code">[{{ f.code }}] {{ f.message }}；</template>
+    </p>
+    <p class="msg" v-if="report && !(report.failures && report.failures.length)">
+      重建报告实时互证：{{ report.reconciled ? '一致（绿）' : '不符' }} · 已钉 {{ report.sealed_count }} 笔 / {{ report.sealed_total }} · 待钉 {{ report.open_count }} 笔 / {{ report.open_total }}
+    </p>
     <p class="msg" v-if="msg">{{ msg }}</p>
     <p class="msg err" v-if="err">{{ err }}</p>
   </div>
